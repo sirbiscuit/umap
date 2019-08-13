@@ -806,12 +806,12 @@ def rdist(x, y):
 
 
 @numba.njit(fastmath=True, parallel=True)
-def optimize_layout(
+def optimize_layout_step(
     head_embedding,
     tail_embedding,
     head,
     tail,
-    n_epochs,
+    n,
     n_vertices,
     epochs_per_sample,
     a,
@@ -896,78 +896,116 @@ def optimize_layout(
     )
     epoch_of_next_sample = epochs_per_sample.copy()
 
-    for n in range(n_epochs):
-        for i in range(epochs_per_sample.shape[0]):
-            if epoch_of_next_sample[i] <= n:
-                j = head[i]
-                k = tail[i]
+    for i in range(epochs_per_sample.shape[0]):
+        if epoch_of_next_sample[i] <= n:
+            j = head[i]
+            k = tail[i]
 
-                current = head_embedding[j]
+            current = head_embedding[j]
+            other = tail_embedding[k]
+
+            dist_squared = rdist(current, other)
+
+            if dist_squared > 0.0:
+                grad_coeff = (
+                    -2.0
+                    * a
+                    * b
+                    * pow(dist_squared, b - 1.0)
+                )
+                grad_coeff /= (
+                    a * pow(dist_squared, b) + 1.0
+                )
+            else:
+                grad_coeff = 0.0
+
+            for d in range(dim):
+                grad_d = clip(
+                    grad_coeff * (current[d] - other[d])
+                )
+                current[d] += grad_d * alpha
+                if move_other:
+                    other[d] += -grad_d * alpha
+
+            epoch_of_next_sample[
+                i
+            ] += epochs_per_sample[i]
+
+            n_neg_samples = int(
+                (n - epoch_of_next_negative_sample[i])
+                / epochs_per_negative_sample[i]
+            )
+
+            for p in range(n_neg_samples):
+                k = tau_rand_int(rng_state) % n_vertices
+
                 other = tail_embedding[k]
 
                 dist_squared = rdist(current, other)
 
                 if dist_squared > 0.0:
-                    grad_coeff = (
-                        -2.0
-                        * a
-                        * b
-                        * pow(dist_squared, b - 1.0)
-                    )
+                    grad_coeff = 2.0 * gamma * b
                     grad_coeff /= (
-                        a * pow(dist_squared, b) + 1.0
-                    )
+                        0.001 + dist_squared
+                    ) * (a * pow(dist_squared, b) + 1)
+                elif j == k:
+                    continue
                 else:
                     grad_coeff = 0.0
 
                 for d in range(dim):
-                    grad_d = clip(
-                        grad_coeff * (current[d] - other[d])
-                    )
-                    current[d] += grad_d * alpha
-                    if move_other:
-                        other[d] += -grad_d * alpha
-
-                epoch_of_next_sample[
-                    i
-                ] += epochs_per_sample[i]
-
-                n_neg_samples = int(
-                    (n - epoch_of_next_negative_sample[i])
-                    / epochs_per_negative_sample[i]
-                )
-
-                for p in range(n_neg_samples):
-                    k = tau_rand_int(rng_state) % n_vertices
-
-                    other = tail_embedding[k]
-
-                    dist_squared = rdist(current, other)
-
-                    if dist_squared > 0.0:
-                        grad_coeff = 2.0 * gamma * b
-                        grad_coeff /= (
-                            0.001 + dist_squared
-                        ) * (a * pow(dist_squared, b) + 1)
-                    elif j == k:
-                        continue
+                    if grad_coeff > 0.0:
+                        grad_d = clip(
+                            grad_coeff
+                            * (current[d] - other[d])
+                        )
                     else:
-                        grad_coeff = 0.0
+                        grad_d = 4.0
+                    current[d] += grad_d * alpha
 
-                    for d in range(dim):
-                        if grad_coeff > 0.0:
-                            grad_d = clip(
-                                grad_coeff
-                                * (current[d] - other[d])
-                            )
-                        else:
-                            grad_d = 4.0
-                        current[d] += grad_d * alpha
+            epoch_of_next_negative_sample[i] += (
+                n_neg_samples
+                * epochs_per_negative_sample[i]
+            )
 
-                epoch_of_next_negative_sample[i] += (
-                    n_neg_samples
-                    * epochs_per_negative_sample[i]
-                )
+    return head_embedding, tail_embedding
+
+
+def optimize_layout(
+    head_embedding,
+    tail_embedding,
+    head,
+    tail,
+    n_epochs,
+    n_vertices,
+    epochs_per_sample,
+    a,
+    b,
+    rng_state,
+    gamma=1.0,
+    initial_alpha=1.0,
+    negative_sample_rate=5.0,
+    verbose=False,
+    callback=None,
+):
+    alpha = initial_alpha
+    for n in range(n_epochs):
+        head_embedding, tail_embedding = optimize_layout_step(
+            head_embedding,
+            tail_embedding,
+            head,
+            tail,
+            n,
+            n_vertices,
+            epochs_per_sample,
+            a,
+            b,
+            rng_state,
+            gamma=1.0,
+            initial_alpha=alpha,
+            negative_sample_rate=5.0,
+            verbose=False,
+        )
 
         alpha = initial_alpha * (
             1.0 - (float(n) / float(n_epochs))
@@ -977,6 +1015,9 @@ def optimize_layout(
             print(
                 "\tcompleted ", n, " / ", n_epochs, "epochs"
             )
+
+        if callback:
+            callback(n, head_embedding)
 
     return head_embedding
 
@@ -996,6 +1037,7 @@ def simplicial_set_embedding(
     metric,
     metric_kwds,
     verbose,
+    callback,
 ):
     """Perform a fuzzy simplicial set embedding, using a specified
     initialisation method and then minimizing the fuzzy set cross entropy
@@ -1148,6 +1190,7 @@ def simplicial_set_embedding(
         initial_alpha,
         negative_sample_rate,
         verbose=verbose,
+        callback=callback,
     )
 
     return embedding
@@ -1406,6 +1449,7 @@ class UMAP(BaseEstimator):
         target_weight=0.5,
         transform_seed=42,
         verbose=False,
+        callback=None,
     ):
 
         self.n_neighbors = n_neighbors
@@ -1431,6 +1475,7 @@ class UMAP(BaseEstimator):
         self.target_weight = target_weight
         self.transform_seed = transform_seed
         self.verbose = verbose
+        self.callback = callback
 
         self.a = a
         self.b = b
@@ -1792,6 +1837,7 @@ class UMAP(BaseEstimator):
             self.metric,
             self._metric_kwds,
             self.verbose,
+            callback=self.callback,
         )
 
         if self.verbose:
@@ -1989,6 +2035,8 @@ class UMAP(BaseEstimator):
             self._initial_alpha,
             self.negative_sample_rate,
             verbose=self.verbose,
+            callback=self.callback
         )
 
         return embedding
+
